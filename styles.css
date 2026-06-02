@@ -146,6 +146,18 @@ html, body {
 }
 #sidebar-actions button { flex: 1; font-size: 0.8rem; padding: 0.45rem 0; }
 
+.net-status {
+  margin: 0 0.75rem 0.5rem;
+  padding: 0.3rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-align: center;
+  color: #fff;
+  background: var(--danger);
+}
+.net-status[hidden] { display: none; }
+
 #sidebar-body {
   flex: 1;
   display: flex;

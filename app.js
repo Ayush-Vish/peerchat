@@ -1596,6 +1596,15 @@ function connectGlobalSSE() {
     updateRoomPeerCount(S.activeRoom);
   });
 
+  es.addEventListener("network-status", (ev) => {
+    touch();
+    try {
+      const { mode } = JSON.parse(ev.data);
+      const badge = $("net-status");
+      if (badge) badge.hidden = mode !== "offline";
+    } catch {}
+  });
+
   es.addEventListener("room-update", (ev) => {
     touch();
     try {

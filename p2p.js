@@ -46,6 +46,7 @@ let dataPath = null;
 let activeRoom = null;
 let persistTimer = null;
 let peerCountTimer = null;
+let networkMode = "online";
 
 let savedData = { profile: {}, rooms: {}, peerProfiles: {} };
 
@@ -588,6 +589,10 @@ export function initChat(sdk, options = {}) {
     }
   }
 
+  attachSwarmConnectionHandler(sdk);
+}
+
+function attachSwarmConnectionHandler(sdk) {
   sdk.swarm.on("connection", (conn, info) => {
     const remoteId = conn.remotePublicKey
       ? b4a.toString(conn.remotePublicKey, "hex").slice(0, 8).toLowerCase()
@@ -984,6 +989,43 @@ export function initChat(sdk, options = {}) {
       }
     });
   });
+}
+
+// Rewire chat onto a freshly created SDK after a network-mode restart.
+// Identity (localId) and on-disk room feeds are preserved; we only re-open
+// feeds on the new corestore and re-join swarm topics on the new swarm.
+export async function reconfigureChat(newSdk) {
+  if (!newSdk) return;
+  localId = newSdk.publicKey ? b4a.toString(newSdk.publicKey, "hex").slice(0, 8).toLowerCase() : "local";
+
+  // Old swarm connections are gone after the previous SDK was closed.
+  peers = [];
+
+  // Feeds belong to the previous corestore; drop refs so joinRoom reopens them.
+  for (const k of Object.keys(roomFeeds)) delete roomFeeds[k];
+  joinedRooms.clear();
+  discoveryKeys.clear();
+
+  attachSwarmConnectionHandler(newSdk);
+
+  for (const k of Object.keys(savedData.rooms)) {
+    try {
+      await joinRoom(newSdk, k);
+    } catch (e) {
+      console.error(`[chat] Rejoin ${k.slice(0, 8)}: ${e.message}`);
+    }
+  }
+
+  broadcastPeerCountNow();
+}
+
+export function setNetworkMode(mode) {
+  networkMode = mode === "offline" ? "offline" : "online";
+  broadcastGlobal("network-status", { mode: networkMode });
+}
+
+export function getNetworkMode() {
+  return networkMode;
 }
 
 function respond(status, data) {
@@ -1470,6 +1512,8 @@ export async function handleChatRequest(req, sdk) {
 
         const onlineIds = [...new Set(peers.map((p) => p.id))];
         stream.write(`event: online-peers\ndata: ${JSON.stringify({ peers: onlineIds })}\n\n`);
+
+        stream.write(`event: network-status\ndata: ${JSON.stringify({ mode: networkMode })}\n\n`);
 
         for (const k of Object.keys(savedData.rooms)) {
           const p = roomUpdatePayload(k);
