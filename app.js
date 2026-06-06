@@ -1601,7 +1601,13 @@ function connectGlobalSSE() {
     try {
       const { mode } = JSON.parse(ev.data);
       const badge = $("net-status");
-      if (badge) badge.hidden = mode !== "offline";
+      if (badge) {
+        const isOffline = mode === "offline";
+        badge.hidden = false;
+        badge.classList.toggle("offline", isOffline);
+        badge.classList.toggle("online", !isOffline);
+        badge.textContent = isOffline ? "Network: Offline - LAN only" : "Network: Online";
+      }
     } catch {}
   });
 

@@ -565,7 +565,9 @@ async function joinRoom(sdk, roomKey) {
     joinedRooms.add(roomKey);
     discoveryKeys.add(roomKey);
     sdk.join(b4a.from(roomKey, "hex"), { client: true, server: true });
-    await sdk.swarm.flush();
+    if (networkMode !== "offline") {
+      await sdk.swarm.flush();
+    }
   }
 }
 
