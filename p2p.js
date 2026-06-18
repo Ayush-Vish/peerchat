@@ -1,4 +1,6 @@
 import { PassThrough } from "stream";
+import dgram from "dgram";
+import net from "net";
 import {
   createHash,
   createCipheriv,
@@ -29,6 +31,14 @@ const KEEPALIVE_MS = 15_000;
 const PING_MS = 25_000;
 const SEEN_CAP = 10_000;
 const PERSIST_DELAY_MS = 2_000;
+const LAN_DISCOVERY_GROUP = "239.255.42.99";
+const LAN_DISCOVERY_PORT = 49799;
+const LAN_ANNOUNCE_MS = 5_000;
+const LAN_HELLO_TIMEOUT_MS = 5_000;
+const LAN_CONNECT_COOLDOWN_MS = 10_000;
+const LAN_MAX_ROOMS = 128;
+const LAN_PROTOCOL = "peersky-peerchat-lan";
+const SWARM_FLUSH_TIMEOUT_MS = 8_000;
 
 const roomFeeds = {};
 const roomSseClients = {};
@@ -46,7 +56,14 @@ let dataPath = null;
 let activeRoom = null;
 let persistTimer = null;
 let peerCountTimer = null;
-let networkMode = "online";
+let networkMode = "offline";
+let internetReachable = false;
+let lanUdpSocket = null;
+let lanTcpServer = null;
+let lanTcpPort = 0;
+let lanAnnounceTimer = null;
+let lanCurrentSdk = null;
+let lanConnectAttempts = new Map();
 
 let savedData = { profile: {}, rooms: {}, peerProfiles: {} };
 
@@ -248,6 +265,18 @@ function broadcastGlobal(event, data) {
   for (let i = dead.length - 1; i >= 0; i--) globalSseClients.splice(dead[i], 1);
 }
 
+function networkStatusPayload() {
+  return {
+    mode: networkMode,
+    internetReachable,
+    lanAvailable: !!lanTcpPort,
+  };
+}
+
+function broadcastNetworkStatus() {
+  broadcastGlobal("network-status", networkStatusPayload());
+}
+
 function roomUpdatePayload(roomKey) {
   const room = savedData.rooms[roomKey];
   if (!room) return null;
@@ -357,8 +386,8 @@ async function syncRoomHistoryTo(conn, rk) {
   }
 }
 
-async function syncHistoryTo(conn) {
-  for (const rk of Object.keys(roomFeeds)) {
+async function syncHistoryTo(conn, roomKeys = Object.keys(roomFeeds)) {
+  for (const rk of roomKeys) {
     await syncRoomHistoryTo(conn, rk);
   }
   if (!conn.destroyed) {
@@ -401,15 +430,16 @@ function appendModerationNotice(roomKey, sourceId, peerName, modResult, ts) {
   }).catch(() => {});
 }
 
-function shareProfile(conn) {
+function shareProfile(conn, roomKeys = Object.keys(savedData.rooms)) {
   if (!savedData.profile?.username) return;
+  const rooms = roomKeys.filter((rk) => savedData.rooms[rk]);
   try {
     conn.write(JSON.stringify({
       type: "profile", peerId: localId,
       username: savedData.profile.username,
       bio: savedData.profile.bio || "",
       avatar: savedData.profile.avatar || null,
-      rooms: Object.keys(savedData.rooms),
+      rooms,
     }) + "\n");
   } catch {}
 }
@@ -438,14 +468,15 @@ function sendRoomMeta(conn, rk) {
 }
 
 
-function shareRoomMeta(conn) {
-  for (const rk of Object.keys(savedData.rooms)) {
+function shareRoomMeta(conn, roomKeys = Object.keys(savedData.rooms)) {
+  for (const rk of roomKeys) {
     sendRoomMeta(conn, rk);
   }
 }
 
-function shareMembers(conn) {
-  for (const [rk, room] of Object.entries(savedData.rooms)) {
+function shareMembers(conn, roomKeys = Object.keys(savedData.rooms)) {
+  for (const rk of roomKeys) {
+    const room = savedData.rooms[rk];
     if (!room.members || !roomFeeds[rk]) continue;
     try {
       conn.write(JSON.stringify({ type: "members-list", roomKey: rk, members: room.members }) + "\n");
@@ -453,9 +484,10 @@ function shareMembers(conn) {
   }
 }
 
-function announceJoins(conn) {
+function announceJoins(conn, roomKeys = Object.keys(savedData.rooms)) {
   const uname = savedData.profile?.username || localId;
-  for (const [rk, room] of Object.entries(savedData.rooms)) {
+  for (const rk of roomKeys) {
+    const room = savedData.rooms[rk];
     if (!room || !roomFeeds[rk]) continue;
     const joinTs = room.joinedAt || room.createdAt || Date.now();
     if (!room.joinedAt) { room.joinedAt = joinTs; debouncePersist(); }
@@ -565,9 +597,8 @@ async function joinRoom(sdk, roomKey) {
     joinedRooms.add(roomKey);
     discoveryKeys.add(roomKey);
     sdk.join(b4a.from(roomKey, "hex"), { client: true, server: true });
-    if (networkMode !== "offline") {
-      await sdk.swarm.flush();
-    }
+    scheduleLanAnnouncement();
+    await flushSwarmSoon(sdk);
   }
 }
 
@@ -579,6 +610,7 @@ export function initChat(sdk, options = {}) {
   initModeration().catch((e) => console.warn("[chat] Moderation blocklist load failed:", e.message));
 
   loadData();
+  startLanDiscovery(sdk);
 
   setInterval(() => {
     if (globalSseClients.length > 0) sendPeerCount();
@@ -595,7 +627,10 @@ export function initChat(sdk, options = {}) {
 }
 
 function attachSwarmConnectionHandler(sdk) {
-  sdk.swarm.on("connection", (conn, info) => {
+  sdk.swarm.on("connection", (conn, info) => handlePeerChatConnection(conn, info));
+}
+
+function handlePeerChatConnection(conn, info = {}) {
     const remoteId = conn.remotePublicKey
       ? b4a.toString(conn.remotePublicKey, "hex").slice(0, 8).toLowerCase()
       : "peer";
@@ -615,17 +650,23 @@ function attachSwarmConnectionHandler(sdk) {
     const peerRooms = connTopics.length > 0 ? connTopics : [...discoveryKeys];
 
     const fk = conn.remotePublicKey && b4a.toString(conn.remotePublicKey, "hex").toLowerCase();
-    if (fk) peers = peers.filter((p) => !p.conn.remotePublicKey || b4a.toString(p.conn.remotePublicKey, "hex").toLowerCase() !== fk);
+    if (fk) {
+      const duplicatePeers = peers.filter((p) => p.conn.remotePublicKey && b4a.toString(p.conn.remotePublicKey, "hex").toLowerCase() === fk);
+      for (const p of duplicatePeers) {
+        try { p.conn.destroy(); } catch {}
+      }
+      peers = peers.filter((p) => !p.conn.remotePublicKey || b4a.toString(p.conn.remotePublicKey, "hex").toLowerCase() !== fk);
+    }
     peers.push({ conn, id: remoteId, rooms: peerRooms });
     broadcastPeerCountNow();
     broadcastGlobal("peer-status", { peerId: remoteId, isOnline: true });
 
-    shareProfile(conn);
-    shareRoomMeta(conn);
-    shareMembers(conn);
-    announceJoins(conn);
+    shareProfile(conn, peerRooms);
+    shareRoomMeta(conn, peerRooms);
+    shareMembers(conn, peerRooms);
+    announceJoins(conn, peerRooms);
     shareDMInvites(conn, remoteId);
-    syncHistoryTo(conn).catch(() => {});
+    syncHistoryTo(conn, peerRooms).catch(() => {});
 
     const pingTimer = setInterval(() => {
       if (conn.destroyed) { clearInterval(pingTimer); return; }
@@ -990,7 +1031,235 @@ function attachSwarmConnectionHandler(sdk) {
         broadcastGlobal("peer-status", { peerId: remoteId, isOnline: false });
       }
     });
+}
+
+function lanRoomKeys() {
+  return [...discoveryKeys].filter(isValidRoomKey).slice(0, LAN_MAX_ROOMS);
+}
+
+function lanRoomToken(roomKey) {
+  return createHash("sha256").update(`${LAN_PROTOCOL}:room:${roomKey}`).digest("hex");
+}
+
+function lanRoomTokens() {
+  return lanRoomKeys().map(lanRoomToken);
+}
+
+function lanPublicKeyHex() {
+  return lanCurrentSdk?.publicKey ? b4a.toString(lanCurrentSdk.publicKey, "hex").toLowerCase() : "";
+}
+
+function makeLanHello() {
+  return {
+    protocol: LAN_PROTOCOL,
+    v: 1,
+    peerKey: lanPublicKeyHex(),
+    peerId: localId,
+    port: lanTcpPort,
+    rooms: lanRoomTokens(),
+    ts: Date.now(),
+  };
+}
+
+function lanTopicsFor(remoteRooms) {
+  if (!Array.isArray(remoteRooms)) return [];
+  const roomsByToken = new Map(lanRoomKeys().map((rk) => [lanRoomToken(rk), rk]));
+  return remoteRooms
+    .map((token) => roomsByToken.get(String(token).toLowerCase()))
+    .filter(Boolean)
+    .map((rk) => b4a.from(rk, "hex"));
+}
+
+function hasOpenConnectionToPeerKey(peerKey) {
+  return peers.some((p) => {
+    if (p.conn.destroyed || !p.conn.remotePublicKey) return false;
+    return b4a.toString(p.conn.remotePublicKey, "hex").toLowerCase() === peerKey;
   });
+}
+
+function isValidLanHello(msg) {
+  return msg?.protocol === LAN_PROTOCOL &&
+    msg.v === 1 &&
+    typeof msg.peerKey === "string" &&
+    /^[a-f0-9]{64}$/i.test(msg.peerKey) &&
+    Number.isInteger(msg.port) &&
+    msg.port > 0 &&
+    msg.port <= 65535 &&
+    Array.isArray(msg.rooms) &&
+    msg.rooms.length <= LAN_MAX_ROOMS &&
+    msg.rooms.every((token) => typeof token === "string" && /^[a-f0-9]{64}$/i.test(token));
+}
+
+function readLanHello(socket) {
+  return new Promise((resolve, reject) => {
+    let total = 0;
+    let buffer = Buffer.alloc(0);
+    const timer = setTimeout(() => done(new Error("LAN hello timed out")), LAN_HELLO_TIMEOUT_MS);
+
+    function done(err, msg) {
+      clearTimeout(timer);
+      socket.off("data", onData);
+      socket.off("error", onError);
+      socket.off("close", onClose);
+      if (err) reject(err);
+      else resolve(msg);
+    }
+
+    function onError(err) {
+      done(err);
+    }
+
+    function onClose() {
+      done(new Error("LAN socket closed before hello"));
+    }
+
+    function onData(chunk) {
+      total += chunk.length;
+      if (total > 64 * 1024) return done(new Error("LAN hello too large"));
+      buffer = Buffer.concat([buffer, chunk]);
+      const newline = buffer.indexOf(10);
+      if (newline === -1) return;
+
+      const line = buffer.subarray(0, newline).toString("utf8");
+      const rest = buffer.subarray(newline + 1);
+      try {
+        const msg = JSON.parse(line);
+        if (rest.length) socket.unshift(rest);
+        done(null, msg);
+      } catch (err) {
+        done(err);
+      }
+    }
+
+    socket.on("data", onData);
+    socket.once("error", onError);
+    socket.once("close", onClose);
+  });
+}
+
+function writeLanHello(socket) {
+  socket.write(JSON.stringify(makeLanHello()) + "\n");
+}
+
+async function acceptLanSocket(socket) {
+  socket.setNoDelay(true);
+  const hello = await readLanHello(socket);
+  if (!isValidLanHello(hello)) throw new Error("Invalid LAN hello");
+
+  const peerKey = hello.peerKey.toLowerCase();
+  if (peerKey === lanPublicKeyHex()) throw new Error("Ignoring self LAN hello");
+
+  const topics = lanTopicsFor(hello.rooms);
+  if (!topics.length) throw new Error("No shared LAN rooms");
+
+  socket.remotePublicKey = b4a.from(peerKey, "hex");
+  writeLanHello(socket);
+  handlePeerChatConnection(socket, { topics });
+}
+
+async function connectLanPeer(peerKey, host, port, rooms) {
+  if (!lanCurrentSdk || !lanTcpPort || hasOpenConnectionToPeerKey(peerKey)) return;
+
+  const attemptKey = `${peerKey}@${host}:${port}`;
+  const lastAttempt = lanConnectAttempts.get(attemptKey) || 0;
+  if (Date.now() - lastAttempt < LAN_CONNECT_COOLDOWN_MS) return;
+  lanConnectAttempts.set(attemptKey, Date.now());
+
+  const topics = lanTopicsFor(rooms);
+  if (!topics.length) return;
+
+  const socket = net.connect({ host, port });
+  socket.setNoDelay(true);
+  socket.setTimeout(LAN_HELLO_TIMEOUT_MS, () => socket.destroy(new Error("LAN connect timed out")));
+
+  try {
+    await new Promise((resolve, reject) => {
+      socket.once("connect", resolve);
+      socket.once("error", reject);
+    });
+    socket.removeAllListeners("error");
+    writeLanHello(socket);
+    const hello = await readLanHello(socket);
+    if (!isValidLanHello(hello) || hello.peerKey.toLowerCase() !== peerKey) {
+      throw new Error("LAN hello peer mismatch");
+    }
+    const confirmedTopics = lanTopicsFor(hello.rooms);
+    if (!confirmedTopics.length) throw new Error("No confirmed shared LAN rooms");
+    socket.setTimeout(0);
+    socket.remotePublicKey = b4a.from(peerKey, "hex");
+    handlePeerChatConnection(socket, { topics: confirmedTopics });
+  } catch (err) {
+    socket.destroy();
+  }
+}
+
+function handleLanAnnouncement(raw, rinfo) {
+  let msg;
+  try {
+    msg = JSON.parse(raw.toString("utf8"));
+  } catch {
+    return;
+  }
+
+  if (!isValidLanHello(msg)) return;
+  const peerKey = msg.peerKey.toLowerCase();
+  if (peerKey === lanPublicKeyHex()) return;
+  if (!lanTopicsFor(msg.rooms).length) return;
+  connectLanPeer(peerKey, rinfo.address, msg.port, msg.rooms).catch(() => {});
+}
+
+function sendLanAnnouncement() {
+  if (!lanUdpSocket || !lanTcpPort || !lanPublicKeyHex() || lanRoomKeys().length === 0) return;
+  const payload = Buffer.from(JSON.stringify(makeLanHello()));
+  lanUdpSocket.send(payload, LAN_DISCOVERY_PORT, LAN_DISCOVERY_GROUP, () => {});
+}
+
+function scheduleLanAnnouncement() {
+  setTimeout(sendLanAnnouncement, 50);
+}
+
+function startLanDiscovery(sdk) {
+  lanCurrentSdk = sdk;
+
+  if (!lanTcpServer) {
+    lanTcpServer = net.createServer((socket) => {
+      acceptLanSocket(socket).catch(() => socket.destroy());
+    });
+    lanTcpServer.on("error", (err) => console.warn("[chat] LAN TCP discovery failed:", err.message));
+    lanTcpServer.listen(0, "0.0.0.0", () => {
+      const address = lanTcpServer.address();
+      lanTcpPort = typeof address === "object" && address ? address.port : 0;
+      broadcastNetworkStatus();
+      sendLanAnnouncement();
+    });
+  }
+
+  if (!lanUdpSocket) {
+    lanUdpSocket = dgram.createSocket({ type: "udp4", reuseAddr: true });
+    lanUdpSocket.on("error", (err) => console.warn("[chat] LAN UDP discovery failed:", err.message));
+    lanUdpSocket.on("message", handleLanAnnouncement);
+    lanUdpSocket.bind(LAN_DISCOVERY_PORT, () => {
+      try { lanUdpSocket.addMembership(LAN_DISCOVERY_GROUP); } catch (err) {
+        console.warn("[chat] LAN multicast membership failed:", err.message);
+      }
+      try { lanUdpSocket.setMulticastTTL(1); } catch {}
+      try { lanUdpSocket.setMulticastLoopback(true); } catch {}
+      if (!lanAnnounceTimer) lanAnnounceTimer = setInterval(sendLanAnnouncement, LAN_ANNOUNCE_MS);
+      sendLanAnnouncement();
+    });
+  }
+}
+
+async function flushSwarmSoon(sdk) {
+  if (!sdk?.swarm?.flush || !internetReachable) return;
+  try {
+    await Promise.race([
+      sdk.swarm.flush(),
+      new Promise((resolve) => setTimeout(resolve, SWARM_FLUSH_TIMEOUT_MS)),
+    ]);
+  } catch (err) {
+    console.warn("[chat] Swarm flush failed:", err.message);
+  }
 }
 
 // Rewire chat onto a freshly created SDK after a network-mode restart.
@@ -999,6 +1268,7 @@ function attachSwarmConnectionHandler(sdk) {
 export async function reconfigureChat(newSdk) {
   if (!newSdk) return;
   localId = newSdk.publicKey ? b4a.toString(newSdk.publicKey, "hex").slice(0, 8).toLowerCase() : "local";
+  lanCurrentSdk = newSdk;
 
   // Old swarm connections are gone after the previous SDK was closed.
   peers = [];
@@ -1009,6 +1279,7 @@ export async function reconfigureChat(newSdk) {
   discoveryKeys.clear();
 
   attachSwarmConnectionHandler(newSdk);
+  startLanDiscovery(newSdk);
 
   for (const k of Object.keys(savedData.rooms)) {
     try {
@@ -1019,15 +1290,34 @@ export async function reconfigureChat(newSdk) {
   }
 
   broadcastPeerCountNow();
+  scheduleLanAnnouncement();
 }
 
 export function setNetworkMode(mode) {
   networkMode = mode === "offline" ? "offline" : "online";
-  broadcastGlobal("network-status", { mode: networkMode });
+  internetReachable = networkMode === "online";
+  broadcastNetworkStatus();
+  if (internetReachable) flushSwarmSoon(lanCurrentSdk).catch(() => {});
 }
 
 export function getNetworkMode() {
   return networkMode;
+}
+
+export function setInternetReachability(reachable) {
+  const nextReachable = !!reachable;
+  const changed = internetReachable !== nextReachable;
+  internetReachable = nextReachable;
+  networkMode = nextReachable ? "online" : "offline";
+  if (changed) {
+    broadcastNetworkStatus();
+    if (nextReachable) flushSwarmSoon(lanCurrentSdk).catch(() => {});
+    else scheduleLanAnnouncement();
+  }
+}
+
+export function getNetworkStatus() {
+  return networkStatusPayload();
 }
 
 function respond(status, data) {
@@ -1370,6 +1660,7 @@ export async function handleChatRequest(req, sdk) {
         delete savedData.rooms[roomKey];
         if (activeRoom === roomKey) activeRoom = null;
         persistData();
+        scheduleLanAnnouncement();
         return respond(200, { ok: true });
       }
 
@@ -1515,7 +1806,7 @@ export async function handleChatRequest(req, sdk) {
         const onlineIds = [...new Set(peers.map((p) => p.id))];
         stream.write(`event: online-peers\ndata: ${JSON.stringify({ peers: onlineIds })}\n\n`);
 
-        stream.write(`event: network-status\ndata: ${JSON.stringify({ mode: networkMode })}\n\n`);
+        stream.write(`event: network-status\ndata: ${JSON.stringify(networkStatusPayload())}\n\n`);
 
         for (const k of Object.keys(savedData.rooms)) {
           const p = roomUpdatePayload(k);

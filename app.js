@@ -1599,10 +1599,10 @@ function connectGlobalSSE() {
   es.addEventListener("network-status", (ev) => {
     touch();
     try {
-      const { mode } = JSON.parse(ev.data);
+      const { mode, internetReachable } = JSON.parse(ev.data);
       const badge = $("net-status");
       if (badge) {
-        const isOffline = mode === "offline";
+        const isOffline = mode === "offline" || internetReachable === false;
         badge.hidden = false;
         badge.classList.toggle("offline", isOffline);
         badge.classList.toggle("online", !isOffline);
